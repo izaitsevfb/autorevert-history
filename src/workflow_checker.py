@@ -46,7 +46,7 @@ class WorkflowRestartChecker:
         Check if a workflow has been restarted for given commit.
         
         Args:
-            workflow_name: Name of workflow (e.g., "trunk.yml")
+            workflow_name: Name of workflow (e.g., "trunk")
             commit_sha: Commit SHA to check
             
         Returns:
@@ -57,21 +57,27 @@ class WorkflowRestartChecker:
             return self._cache[cache_key]
         
         query = """
-        SELECT COUNT(*) as count
-        FROM workflow_job
-        WHERE head_sha = {commit_sha:String}
-          AND workflow_event = 'workflow_dispatch'
+        SELECT 1 as count
+        FROM workflow_job FINAL
+        WHERE (id, run_id) IN (
+          SELECT DISTINCT id, run_id
+          FROM materialized_views.workflow_job_by_head_sha
+          WHERE head_sha = {commit_sha:String}
+        )
+          AND workflow_event = {workflow_event:String}
           AND head_branch = {head_branch:String}
-          AND workflow_name LIKE {workflow_pattern:String}
+          AND workflow_name = {workflow_name:String}
+        LIMIT 1
         """
         
         result = self.client.query(query, {
             'commit_sha': commit_sha,
+            'workflow_event': 'workflow_dispatch',
             'head_branch': f'trunk/{commit_sha}',
-            'workflow_pattern': f'%{workflow_name}'
+            'workflow_name': workflow_name
         })
-        
-        has_restart = result.result_rows[0][0] > 0
+
+        has_restart = len(result.result_rows) > 0
         self._cache[cache_key] = has_restart
         return has_restart
     
@@ -93,12 +99,12 @@ class WorkflowRestartChecker:
         FROM workflow_job
         WHERE workflow_event = 'workflow_dispatch'
           AND head_branch LIKE 'trunk/%'
-          AND workflow_name LIKE {workflow_pattern:String}
+          AND workflow_name = {workflow_name:String}
           AND workflow_created_at >= {since_date:DateTime}
         """
         
         result = self.client.query(query, {
-            'workflow_pattern': f'%{workflow_name}',
+            'workflow_name': workflow_name,
             'since_date': since_date
         })
         

@@ -1,0 +1,8 @@
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# PyTorch HUD client
+git+https://github.com/izaitsevfb/claude-pytorch-treehugger.git
+
+# ClickHouse MCP client
+git+https://github.com/izaitsevfb/clickhouse-mcp.git

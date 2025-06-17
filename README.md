@@ -27,9 +27,8 @@ A collection of scripts to manage PyTorch workflow autoreverts and restart faile
 python scripts/restart_workflows.py
 ```
 
-## Configuration
-
-Configure the following environment variables in your `.env` file:
-- PyTorch HUD endpoints
-- ClickHouse connection details
-- Authentication tokens
+### Find potential revert patterns:
+```
+python src/autorevert_checker.py pull --hours 168
+python src/autorevert_checker.py inductor --hours 72 --verbose
+```

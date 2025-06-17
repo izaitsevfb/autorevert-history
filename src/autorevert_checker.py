@@ -57,19 +57,25 @@ class CommitJobs:
 class AutorevertPatternChecker:
     """Detects autorevert patterns in workflow job failures."""
     
-    def __init__(self, client: Client, workflow_name: str = None, lookback_hours: int = 48):
+    def __init__(self, client: Client, workflow_names: List[str] = None, lookback_hours: int = 48):
         self.client = client
-        self.workflow_name = workflow_name
+        self.workflow_names = workflow_names or []
         self.lookback_hours = lookback_hours
-        self._workflow_commits = None
+        self._workflow_commits_cache = {}  # Dict[str, List[CommitJobs]]
         self._commit_history = None
+    
+    def get_workflow_commits(self, workflow_name: str) -> List[CommitJobs]:
+        """Get workflow commits for a specific workflow, fetching if needed."""
+        if workflow_name not in self._workflow_commits_cache:
+            self._fetch_workflow_data()
+        return self._workflow_commits_cache.get(workflow_name, [])
     
     @property
     def workflow_commits(self) -> List[CommitJobs]:
-        """Get workflow commits, fetching if needed."""
-        if self._workflow_commits is None and self.workflow_name:
-            self._fetch_workflow_data()
-        return self._workflow_commits or []
+        """Get workflow commits for the first workflow (backward compatibility)."""
+        if self.workflow_names:
+            return self.get_workflow_commits(self.workflow_names[0])
+        return []
     
     @property
     def commit_history(self) -> List[Dict]:
@@ -79,13 +85,17 @@ class AutorevertPatternChecker:
         return self._commit_history or []
     
     def _fetch_workflow_data(self):
-        """Fetch workflow job data from ClickHouse."""
+        """Fetch workflow job data from ClickHouse for all workflows in batch."""
+        if not self.workflow_names:
+            return
+            
         lookback_time = datetime.now() - timedelta(hours=self.lookback_hours)
 
-        print(f"Fetching workflow data for '{self.workflow_name}' since {lookback_time.isoformat()}...")
+        print(f"Fetching workflow data for {len(self.workflow_names)} workflows since {lookback_time.isoformat()}...")
         
         query = """
         SELECT 
+            workflow_name,
             head_sha,
             name,
             conclusion,
@@ -93,33 +103,36 @@ class AutorevertPatternChecker:
             torchci_classification.rule as classification_rule,
             workflow_created_at
         FROM workflow_job FINAL
-        WHERE workflow_name = {workflow_name:String}
+        WHERE workflow_name IN {workflow_names:Array(String)}
           AND head_branch = 'main'
           AND workflow_created_at >= {lookback_time:DateTime}
-        ORDER BY workflow_created_at DESC, head_sha, name
+        ORDER BY workflow_name, workflow_created_at DESC, head_sha, name
         """
         
         result = self.client.query(
             query,
             parameters={
-                'workflow_name': self.workflow_name,
+                'workflow_names': self.workflow_names,
                 'lookback_time': lookback_time
             }
         )
         
-        # Group by commit SHA
-        commits_data = {}
+        # Group by workflow and commit SHA
+        workflow_commits_data = {}
         for row in result.result_rows:
-            head_sha, name, conclusion, status, classification_rule, created_at = row
+            workflow_name, head_sha, name, conclusion, status, classification_rule, created_at = row
             
-            if head_sha not in commits_data:
-                commits_data[head_sha] = CommitJobs(
+            if workflow_name not in workflow_commits_data:
+                workflow_commits_data[workflow_name] = {}
+            
+            if head_sha not in workflow_commits_data[workflow_name]:
+                workflow_commits_data[workflow_name][head_sha] = CommitJobs(
                     head_sha=head_sha,
                     created_at=created_at,
                     jobs=[]
                 )
             
-            commits_data[head_sha].jobs.append(JobResult(
+            workflow_commits_data[workflow_name][head_sha].jobs.append(JobResult(
                 head_sha=head_sha,
                 name=name,
                 conclusion=conclusion,
@@ -128,10 +141,19 @@ class AutorevertPatternChecker:
                 workflow_created_at=created_at
             ))
 
-        print(f"Found {len(commits_data)} commits with job data for workflow '{self.workflow_name}'")
+        # Sort and cache results per workflow
+        for workflow_name, commits_data in workflow_commits_data.items():
+            print(f"Found {len(commits_data)} commits with job data for workflow '{workflow_name}'")
+            self._workflow_commits_cache[workflow_name] = sorted(
+                commits_data.values(), 
+                key=lambda c: c.created_at, 
+                reverse=True
+            )
         
-        # Sort by creation time (newest first)
-        self._workflow_commits = sorted(commits_data.values(), key=lambda c: c.created_at, reverse=True)
+        # Initialize empty lists for workflows with no data
+        for workflow_name in self.workflow_names:
+            if workflow_name not in self._workflow_commits_cache:
+                self._workflow_commits_cache[workflow_name] = []
     
     def _fetch_commit_history(self):
         """Fetch commit history from push table."""
@@ -162,19 +184,22 @@ class AutorevertPatternChecker:
             for row in result.result_rows
         ]
     
-    def detect_autorevert_pattern(self) -> List[Dict]:
+    def detect_autorevert_pattern_workflow(self, workflow_name: str) -> List[Dict]:
         """
-        Detect all autorevert patterns in commit job data.
+        Detect all autorevert patterns in commit job data for a specific workflow.
         
         Pattern: 3 consecutive commits where:
         - 2 newer commits have same exact failure classification
         - 1 older commit doesn't have this failure but has matching jobs
         - All commits have signal (jobs present) and no pending jobs in oldest
         
+        Args:
+            workflow_name: The workflow to analyze
+            
         Returns:
             List of all detected patterns
         """
-        commits = self.workflow_commits
+        commits = self.get_workflow_commits(workflow_name)
         if len(commits) < 3:
             return []
         
@@ -220,6 +245,7 @@ class AutorevertPatternChecker:
                 if failed_job_names & older_job_names:
                     patterns.append({
                         'pattern_detected': True,
+                        'workflow_name': workflow_name,
                         'failure_rule': failure_rule,
                         'newer_commits': [newer_commit1.head_sha, newer_commit2.head_sha],
                         'older_commit': older_commit.head_sha,
@@ -228,6 +254,46 @@ class AutorevertPatternChecker:
                     })
         
         return patterns
+    
+    def detect_autorevert_pattern(self) -> List[Dict]:
+        """
+        Detect all autorevert patterns across all configured workflows.
+        
+        When the same commits are detected across multiple workflows, the pattern
+        is kept once with the first workflow, and other workflows are added to
+        an 'additional_workflows' field.
+        
+        Returns:
+            List of all detected patterns from all workflows (deduplicated)
+        """
+        all_patterns = []
+        seen_commit_pairs = {}  # Map of (commit1, commit2) -> pattern index
+        
+        for workflow_name in self.workflow_names:
+            patterns = self.detect_autorevert_pattern_workflow(workflow_name)
+            
+            for pattern in patterns:
+                # Create a key from the two newer commits (order-independent)
+                commit_pair = tuple(sorted(pattern['newer_commits']))
+                
+                if commit_pair in seen_commit_pairs:
+                    # Add this workflow to the existing pattern's additional_workflows
+                    pattern_idx = seen_commit_pairs[commit_pair]
+                    existing_pattern = all_patterns[pattern_idx]
+                    
+                    if 'additional_workflows' not in existing_pattern:
+                        existing_pattern['additional_workflows'] = []
+                    
+                    existing_pattern['additional_workflows'].append({
+                        'workflow_name': workflow_name,
+                        'failure_rule': pattern['failure_rule']
+                    })
+                else:
+                    # First time seeing this commit pair
+                    seen_commit_pairs[commit_pair] = len(all_patterns)
+                    all_patterns.append(pattern)
+        
+        return all_patterns
     
     def is_commit_reverted(self, target_commit_sha: str) -> Optional[Dict]:
         """

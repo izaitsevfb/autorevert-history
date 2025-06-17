@@ -7,15 +7,24 @@ System to automatically restart failed PyTorch CI workflows and track their succ
 ```
 autorevert-history/
 ├── src/
+│   ├── autorevert_checker.py   # Pattern detection & multi-workflow support
 │   ├── workflow_restart.py     # GitHub workflow dispatch API
 │   └── workflow_checker.py     # ClickHouse job differentiation
 ├── scripts/
-│   └── test_workflow_restart.py # CLI testing
+│   ├── test_autorevert_checker.py  # CLI for pattern detection
+│   ├── test_workflow_restart.py    # Workflow restart testing
+│   └── test_multi_workflow.py      # Multi-workflow demo
 └── docs/
     └── workflow-job-differentiation.md # Research findings
 ```
 
 ## Key Components
+
+### Autorevert Pattern Detection (`autorevert_checker.py`)
+- **Pattern**: 2 recent commits with same failure + 1 older without = autorevert candidate
+- **Multi-workflow support**: Batch fetching with per-workflow caching
+- **Deduplication**: Same commits across workflows tracked with `additional_workflows`
+- **Revert detection**: Checks if commits were reverted via commit message patterns
 
 ### Workflow Restart (`workflow_restart.py`)
 - Uses GitHub API `workflow_dispatch` to restart failed workflows
@@ -61,11 +70,38 @@ LIMIT 1
 - ClickHouse job differentiation research
 - Query optimization (removed JOINs)
 - Client migration: `clickhouse-driver` → `clickhouse-connect==0.8.14`
+- **Autorevert pattern detection** with revert checking
+- **Multi-workflow support** with intelligent deduplication
+- **CLI tools** for pattern detection and analysis
 
-### 🔄 Test Case
-- **Commit**: `2d3615f577894c7a117a55e85bb8371bb598ec50`
-- **Original**: run_id `15595052847`, failed, `head_branch="main"`
-- **Restarted**: run_id `15644112883`, in-progress, `head_branch="trunk/2d3615f..."`
+### 🔄 Recent Improvements
+- **Multi-workflow CLI**: Support comma/space separated workflows
+- **Batch queries**: Single ClickHouse query for all workflows
+- **Pattern deduplication**: Track same commits across workflows
+- **Revert detection**: Automatic checking if pattern commits were reverted
+
+### 📊 Usage Examples
+```bash
+# Single workflow
+python scripts/test_autorevert_checker.py pull --hours 48
+
+# Multiple workflows (comma-separated)
+python scripts/test_autorevert_checker.py pull,trunk,inductor --hours 48
+
+# Multiple workflows (space-separated)
+python scripts/test_autorevert_checker.py "pull trunk" --hours 72 --verbose
+
+# API usage
+from autorevert_checker import create_clickhouse_client, AutorevertPatternChecker
+
+client = create_clickhouse_client()
+checker = AutorevertPatternChecker(
+    client, 
+    workflow_names=['pull', 'trunk', 'inductor'],
+    lookback_hours=48
+)
+patterns = checker.detect_autorevert_pattern()  # Deduplicated results
+```
 
 ## Environment Variables
 ```bash
@@ -82,4 +118,6 @@ GITHUB_TOKEN=
 - `python-dotenv>=1.0.0` (env management)
 
 ## Next Phase
-Integration with autorevert decision engine using precise job filtering for workflow restart evaluation.
+- Integration with autorevert decision engine
+- Automated workflow restart based on pattern detection
+- Track success rate of restarted workflows

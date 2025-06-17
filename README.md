@@ -13,11 +13,24 @@ cp .env.example .env  # Add your credentials
 
 ### Detect Autorevert Patterns
 ```bash
+# Single workflow
 python scripts/test_autorevert_checker.py pull --hours 48
-python scripts/test_autorevert_checker.py inductor --hours 72 --verbose
+
+# Multi-workflow analysis
+python scripts/test_multi_workflow.py
 ```
 
-### Restart Failed Workflows
-```bash
-python scripts/restart_workflows.py
+### API Usage
+```python
+from autorevert_checker import create_clickhouse_client, AutorevertPatternChecker
+
+client = create_clickhouse_client()
+checker = AutorevertPatternChecker(
+    client, 
+    workflow_names=['pull', 'trunk', 'inductor'],
+    lookback_hours=48
+)
+
+# Get patterns with automatic deduplication
+patterns = checker.detect_autorevert_pattern()
 ```

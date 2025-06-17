@@ -5,10 +5,8 @@ Autorevert pattern detection for PyTorch CI workflows.
 Detects pattern where 2 recent commits have same failure and 1 older doesn't.
 """
 
-import argparse
 import os
 import re
-import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta
@@ -59,14 +57,32 @@ class CommitJobs:
 class AutorevertPatternChecker:
     """Detects autorevert patterns in workflow job failures."""
     
-    def __init__(self, client: Client):
+    def __init__(self, client: Client, workflow_name: str = None, lookback_hours: int = 48):
         self.client = client
+        self.workflow_name = workflow_name
+        self.lookback_hours = lookback_hours
+        self._workflow_commits = None
+        self._commit_history = None
     
-    def get_recent_commits_data(self, workflow_name: str, lookback_hours: int = 24) -> List[CommitJobs]:
-        """
-        Fetch recent commit job data with simple ClickHouse query.
-        """
-        lookback_time = datetime.now() - timedelta(hours=lookback_hours)
+    @property
+    def workflow_commits(self) -> List[CommitJobs]:
+        """Get workflow commits, fetching if needed."""
+        if self._workflow_commits is None and self.workflow_name:
+            self._fetch_workflow_data()
+        return self._workflow_commits or []
+    
+    @property
+    def commit_history(self) -> List[Dict]:
+        """Get commit history, fetching if needed."""
+        if self._commit_history is None:
+            self._fetch_commit_history()
+        return self._commit_history or []
+    
+    def _fetch_workflow_data(self):
+        """Fetch workflow job data from ClickHouse."""
+        lookback_time = datetime.now() - timedelta(hours=self.lookback_hours)
+
+        print(f"Fetching workflow data for '{self.workflow_name}' since {lookback_time.isoformat()}...")
         
         query = """
         SELECT 
@@ -86,7 +102,7 @@ class AutorevertPatternChecker:
         result = self.client.query(
             query,
             parameters={
-                'workflow_name': workflow_name,
+                'workflow_name': self.workflow_name,
                 'lookback_time': lookback_time
             }
         )
@@ -111,11 +127,42 @@ class AutorevertPatternChecker:
                 classification_rule=classification_rule or '',
                 workflow_created_at=created_at
             ))
+
+        print(f"Found {len(commits_data)} commits with job data for workflow '{self.workflow_name}'")
         
         # Sort by creation time (newest first)
-        return sorted(commits_data.values(), key=lambda c: c.created_at, reverse=True)
+        self._workflow_commits = sorted(commits_data.values(), key=lambda c: c.created_at, reverse=True)
     
-    def detect_autorevert_pattern(self, commits: List[CommitJobs]) -> List[Dict]:
+    def _fetch_commit_history(self):
+        """Fetch commit history from push table."""
+        lookback_time = datetime.now() - timedelta(hours=self.lookback_hours)
+        
+        query = """
+        SELECT DISTINCT
+            head_commit.id as sha,
+            head_commit.message as message,
+            head_commit.timestamp as timestamp
+        FROM default.push 
+        WHERE head_commit.timestamp >= {lookback_time:DateTime}
+          AND ref = 'refs/heads/main'
+        ORDER BY head_commit.timestamp DESC
+        """
+        
+        result = self.client.query(
+            query,
+            parameters={'lookback_time': lookback_time}
+        )
+        
+        self._commit_history = [
+            {
+                'sha': row[0],
+                'message': row[1],
+                'timestamp': row[2]
+            }
+            for row in result.result_rows
+        ]
+    
+    def detect_autorevert_pattern(self) -> List[Dict]:
         """
         Detect all autorevert patterns in commit job data.
         
@@ -127,6 +174,7 @@ class AutorevertPatternChecker:
         Returns:
             List of all detected patterns
         """
+        commits = self.workflow_commits
         if len(commits) < 3:
             return []
         
@@ -180,6 +228,50 @@ class AutorevertPatternChecker:
                     })
         
         return patterns
+    
+    def is_commit_reverted(self, target_commit_sha: str) -> Optional[Dict]:
+        """
+        Check if a commit was reverted within the lookback window.
+        
+        Args:
+            target_commit_sha: The commit to check for reverting
+        
+        Returns:
+            Dict with revert information if found, None otherwise
+        """
+        commits = self.commit_history
+        target_time = None
+        
+        # Find target commit timestamp
+        for commit in commits:
+            if commit['sha'] == target_commit_sha:
+                target_time = commit['timestamp']
+                break
+        
+        if not target_time:
+            return None  # Target commit not found
+        
+        # Look for revert commits after target commit
+        for commit in commits:
+            commit_time = commit['timestamp']
+            
+            # Only consider commits after target
+            if commit_time <= target_time:
+                continue
+            
+            message = commit['message']
+            
+            # Check for revert pattern
+            if message.startswith('Revert "') and f"This reverts commit {target_commit_sha}" in message:
+                return {
+                    'reverted': True,
+                    'revert_sha': commit['sha'],
+                    'revert_message': message,
+                    'revert_timestamp': commit_time,
+                    'hours_after_target': (commit_time - target_time).total_seconds() / 3600
+                }
+        
+        return None  # No revert found
 
 
 def create_clickhouse_client() -> Client:
@@ -193,136 +285,3 @@ def create_clickhouse_client() -> Client:
         database='default',
         secure=True
     )
-
-
-def main():
-    """CLI interface for autorevert pattern detection."""
-    parser = argparse.ArgumentParser(
-        description="Detect autorevert patterns in PyTorch CI workflows",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s pull --hours 48
-  %(prog)s inductor --hours 72 --verbose
-  %(prog)s "linux-binary-manywheel" --hours 24 -v
-        """
-    )
-    
-    parser.add_argument(
-        'workflow', 
-        nargs='?',
-        help='Workflow name to analyze (e.g., "pull", "inductor")'
-    )
-    parser.add_argument(
-        '--hours',
-        type=int,
-        default=48,
-        help='Lookback window in hours (default: 48)'
-    )
-    parser.add_argument(
-        '--verbose', '-v',
-        action='store_true',
-        help='Show detailed output including commit summaries'
-    )
-    parser.add_argument(
-        '--test-connection',
-        action='store_true',
-        help='Test ClickHouse connection and exit'
-    )
-    
-    args = parser.parse_args()
-    
-    # Test connection if requested
-    if args.test_connection:
-        try:
-            client = create_clickhouse_client()
-            client.query('SELECT 1')
-            print("✓ ClickHouse connection successful")
-            return 0
-        except Exception as e:
-            print(f"✗ ClickHouse connection failed: {e}")
-            return 1
-    
-    # Workflow argument is required for non-test operations
-    if not args.workflow:
-        parser.error("workflow argument is required (unless using --test-connection)")
-        return 1
-    
-    try:
-        # Initialize checker
-        client = create_clickhouse_client()
-        checker = AutorevertPatternChecker(client)
-        
-        # Fetch data
-        if args.verbose:
-            print(f"Fetching commits for workflow '{args.workflow}' (last {args.hours}h)...")
-        
-        commits = checker.get_recent_commits_data(args.workflow, args.hours)
-        
-        if not commits:
-            print(f"No commit data found for workflow '{args.workflow}' in last {args.hours}h")
-            return 1
-        
-        if args.verbose:
-            print(f"Found {len(commits)} commits with job data")
-            print("\nRecent commits:")
-            for i, commit in enumerate(commits[:10]):
-                failed_count = len(commit.failed_jobs)
-                total_count = len(commit.jobs)
-                pending = " (PENDING)" if commit.has_pending_jobs else ""
-                print(f"  {i+1:2d}. {commit.head_sha[:8]} ({commit.created_at.strftime('%m-%d %H:%M')}) - "
-                      f"{failed_count:2d}/{total_count:2d} failed{pending}")
-        
-        # Detect patterns
-        patterns = checker.detect_autorevert_pattern(commits)
-        
-        if patterns:
-            print(f"✓ {len(patterns)} AUTOREVERT PATTERN{'S' if len(patterns) > 1 else ''} DETECTED")
-            
-            for i, pattern in enumerate(patterns, 1):
-                if len(patterns) > 1:
-                    print(f"\nPattern #{i}:")
-                print(f"Failure rule: '{pattern['failure_rule']}'")
-                print(f"Recent commits with failure: {' '.join(sha[:8] for sha in pattern['newer_commits'])}")
-                print(f"Older commit without failure: {pattern['older_commit'][:8]}")
-                
-                if args.verbose:
-                    print(f"Failed jobs ({len(pattern['failed_job_names'])}):")
-                    for job in pattern['failed_job_names'][:5]:
-                        print(f"  - {job}")
-                    if len(pattern['failed_job_names']) > 5:
-                        print(f"  ... and {len(pattern['failed_job_names']) - 5} more")
-                    
-                    print(f"Job coverage overlap ({len(pattern['older_job_coverage'])}):")
-                    for job in pattern['older_job_coverage'][:3]:
-                        print(f"  - {job}")
-                    if len(pattern['older_job_coverage']) > 3:
-                        print(f"  ... and {len(pattern['older_job_coverage']) - 3} more")
-            
-            return 0
-        else:
-            print("✗ No autorevert patterns detected")
-            
-            if args.verbose and len(commits) >= 3:
-                print(f"\nDiagnostic (first 3 commits):")
-                for i, commit in enumerate(commits[:3]):
-                    failures = {j.classification_rule for j in commit.failed_jobs if j.classification_rule}
-                    print(f"  {i+1}. {commit.head_sha[:8]}: {len(failures)} unique failure types")
-                    if failures:
-                        for rule in list(failures)[:2]:
-                            print(f"     - {rule}")
-                        if len(failures) > 2:
-                            print(f"     ... and {len(failures) - 2} more")
-            
-            return 1
-            
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        if args.verbose:
-            import traceback
-            traceback.print_exc()
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

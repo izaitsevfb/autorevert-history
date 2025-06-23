@@ -2,7 +2,10 @@
 """
 Autorevert pattern detection for PyTorch CI workflows.
 
-Detects pattern where 2 recent commits have same failure and 1 older doesn't.
+Detects optimistic pattern where a failure appears on a commit that:
+- Did NOT have this failure in the 8 hours before
+- DOES have this failure on the target commit
+- Also has this failure in commits within 8 hours after
 """
 
 import os
@@ -186,12 +189,12 @@ class AutorevertPatternChecker:
     
     def detect_autorevert_pattern_workflow(self, workflow_name: str) -> List[Dict]:
         """
-        Detect all autorevert patterns in commit job data for a specific workflow.
+        Detect optimistic autorevert patterns in commit job data for a specific workflow.
         
-        Pattern: 3 consecutive commits where:
-        - 2 newer commits have same exact failure classification
-        - 1 older commit doesn't have this failure but has matching jobs
-        - All commits have signal (jobs present) and no pending jobs in oldest
+        Pattern: Target commit with failure line where:
+        - Lookback: failure line NOT present in 8 hours before target commit
+        - Target: failure line IS present on the target commit
+        - Lookahead: failure line IS also present in any commits in 8 hours after
         
         Args:
             workflow_name: The workflow to analyze
@@ -200,58 +203,86 @@ class AutorevertPatternChecker:
             List of all detected patterns
         """
         commits = self.get_workflow_commits(workflow_name)
-        if len(commits) < 3:
+        if not commits:
             return []
         
         patterns = []
+        lookback_hours = 8
+        lookahead_hours = 8
         
-        for i in range(len(commits) - 2):
-            newer_commit1 = commits[i]      # Most recent
-            newer_commit2 = commits[i + 1]  # Second most recent  
-            older_commit = commits[i + 2]   # Third most recent
-            
-            # All commits must have jobs (signal)
-            if not all(c.jobs for c in [newer_commit1, newer_commit2, older_commit]):
+        # Process each commit as a potential target
+        for i, target_commit in enumerate(commits):
+            # Skip if target has no failures
+            if not target_commit.failed_jobs:
                 continue
                 
-            # Oldest commit cannot have pending jobs
-            if older_commit.has_pending_jobs:
+            # Skip if target has pending jobs
+            if target_commit.has_pending_jobs:
                 continue
             
-            # Find common failure classifications between the 2 newer commits
-            newer1_failures = {j.classification_rule for j in newer_commit1.failed_jobs}
-            newer2_failures = {j.classification_rule for j in newer_commit2.failed_jobs}
-            common_failures = newer1_failures & newer2_failures
+            target_time = target_commit.created_at
             
-            if not common_failures:
-                continue
+            # Get all failure rules in target commit
+            target_failures = {j.classification_rule for j in target_commit.failed_jobs}
             
-            # Check if older commit lacks these failures but has overlapping job coverage
-            older_failures = {j.classification_rule for j in older_commit.failed_jobs}
-            older_job_names = older_commit.get_job_base_names()
-            
-            for failure_rule in common_failures:
-                if failure_rule in older_failures:
-                    continue  # Older commit also has this failure
+            for failure_rule in target_failures:
+                # Get commits in lookback window (8 hours before)
+                lookback_commits = []
+                for j in range(i + 1, len(commits)):
+                    commit = commits[j]
+                    time_diff = (target_time - commit.created_at).total_seconds() / 3600
+                    if time_diff > lookback_hours:
+                        break
+                    lookback_commits.append(commit)
                 
-                # Get job names that had this failure in newer commits
-                failed_job_names = set()
-                for commit in [newer_commit1, newer_commit2]:
-                    for job in commit.failed_jobs:
-                        if job.classification_rule == failure_rule:
-                            failed_job_names.add(commit.normalize_job_name(job.name))
+                # Get commits in lookahead window (8 hours after)
+                lookahead_commits = []
+                for j in range(i - 1, -1, -1):
+                    commit = commits[j]
+                    time_diff = (commit.created_at - target_time).total_seconds() / 3600
+                    if time_diff > lookahead_hours:
+                        break
+                    lookahead_commits.append(commit)
                 
-                # Check if older commit has overlapping job coverage
-                if failed_job_names & older_job_names:
-                    patterns.append({
-                        'pattern_detected': True,
-                        'workflow_name': workflow_name,
-                        'failure_rule': failure_rule,
-                        'newer_commits': [newer_commit1.head_sha, newer_commit2.head_sha],
-                        'older_commit': older_commit.head_sha,
-                        'failed_job_names': list(failed_job_names),
-                        'older_job_coverage': list(older_job_names & failed_job_names)
-                    })
+                # Check lookback: failure should NOT be present
+                failure_in_lookback = False
+                for commit in lookback_commits:
+                    if any(j.classification_rule == failure_rule for j in commit.failed_jobs):
+                        failure_in_lookback = True
+                        break
+                
+                if failure_in_lookback:
+                    continue  # Skip this failure rule, it was present before
+                
+                # Check lookahead: failure SHOULD be present in at least one commit
+                lookahead_commits_with_failure = []
+                for commit in lookahead_commits:
+                    if any(j.classification_rule == failure_rule for j in commit.failed_jobs):
+                        lookahead_commits_with_failure.append(commit.head_sha)
+                
+                if not lookahead_commits_with_failure:
+                    continue  # Skip this failure rule, it doesn't persist after
+                
+                # Pattern detected!
+                # Get job names that had this failure
+                failed_job_names = []
+                for job in target_commit.failed_jobs:
+                    if job.classification_rule == failure_rule:
+                        failed_job_names.append(target_commit.normalize_job_name(job.name))
+                
+                patterns.append({
+                    'pattern_detected': True,
+                    'workflow_name': workflow_name,
+                    'failure_rule': failure_rule,
+                    'target_commit': target_commit.head_sha,
+                    'target_commit_time': target_time.isoformat(),
+                    'lookahead_commits': lookahead_commits_with_failure,
+                    'failed_job_names': failed_job_names,
+                    'lookback_window_hours': lookback_hours,
+                    'lookahead_window_hours': lookahead_hours,
+                    'lookback_commits_checked': len(lookback_commits),
+                    'lookahead_commits_checked': len(lookahead_commits)
+                })
         
         return patterns
     
@@ -259,7 +290,7 @@ class AutorevertPatternChecker:
         """
         Detect all autorevert patterns across all configured workflows.
         
-        When the same commits are detected across multiple workflows, the pattern
+        When the same target commit is detected across multiple workflows, the pattern
         is kept once with the first workflow, and other workflows are added to
         an 'additional_workflows' field.
         
@@ -267,18 +298,18 @@ class AutorevertPatternChecker:
             List of all detected patterns from all workflows (deduplicated)
         """
         all_patterns = []
-        seen_commit_pairs = {}  # Map of (commit1, commit2) -> pattern index
+        seen_target_commits = {}  # Map of target_commit -> pattern index
         
         for workflow_name in self.workflow_names:
             patterns = self.detect_autorevert_pattern_workflow(workflow_name)
             
             for pattern in patterns:
-                # Create a key from the two newer commits (order-independent)
-                commit_pair = tuple(sorted(pattern['newer_commits']))
+                # Use target commit as the deduplication key
+                target_commit = pattern['target_commit']
                 
-                if commit_pair in seen_commit_pairs:
+                if target_commit in seen_target_commits:
                     # Add this workflow to the existing pattern's additional_workflows
-                    pattern_idx = seen_commit_pairs[commit_pair]
+                    pattern_idx = seen_target_commits[target_commit]
                     existing_pattern = all_patterns[pattern_idx]
                     
                     if 'additional_workflows' not in existing_pattern:
@@ -289,8 +320,8 @@ class AutorevertPatternChecker:
                         'failure_rule': pattern['failure_rule']
                     })
                 else:
-                    # First time seeing this commit pair
-                    seen_commit_pairs[commit_pair] = len(all_patterns)
+                    # First time seeing this target commit
+                    seen_target_commits[target_commit] = len(all_patterns)
                     all_patterns.append(pattern)
         
         return all_patterns

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-CLI tool for autorevert pattern detection with automatic revert checking.
+CLI tool for optimistic autorevert pattern detection with automatic revert checking.
+
+Detects failures that appear on a commit but weren't present in the 8 hours before
+and persist in commits within 8 hours after.
 """
 
 import argparse
@@ -15,7 +18,7 @@ from autorevert_checker import create_clickhouse_client, AutorevertPatternChecke
 def main():
     """CLI interface for autorevert pattern detection."""
     parser = argparse.ArgumentParser(
-        description="Detect autorevert patterns in PyTorch CI workflows",
+        description="Detect optimistic autorevert patterns in PyTorch CI workflows",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -124,8 +127,9 @@ Examples:
                     print(f"\nPattern #{i}:")
                 
                 print(f"Failure rule: '{pattern['failure_rule']}'")
-                print(f"Recent commits with failure: {' '.join(sha[:8] for sha in pattern['newer_commits'])}")
-                print(f"Older commit without failure: {pattern['older_commit'][:8]}")
+                print(f"Target commit: {pattern['target_commit'][:8]} ({pattern['target_commit_time']})")
+                print(f"Failure persisted in {len(pattern['lookahead_commits'])} commits after target")
+                print(f"No failure in {pattern['lookback_commits_checked']} commits in 8h before")
                 
                 # Show additional workflows if detected
                 if 'additional_workflows' in pattern:
@@ -133,16 +137,16 @@ Examples:
                     for additional in pattern['additional_workflows']:
                         print(f"  - {additional['workflow_name']}: {additional['failure_rule']}")
                 
-                # Check if the second commit (older of the two failures) was reverted
-                second_commit = pattern['newer_commits'][1]
-                revert_result = revert_checker.is_commit_reverted(second_commit)
+                # Check if the target commit was reverted
+                target_commit = pattern['target_commit']
+                revert_result = revert_checker.is_commit_reverted(target_commit)
                 
                 if revert_result:
-                    print(f"✓ REVERTED: {second_commit[:8]} was reverted by {revert_result['revert_sha'][:8]} "
+                    print(f"✓ REVERTED: {target_commit[:8]} was reverted by {revert_result['revert_sha'][:8]} "
                           f"after {revert_result['hours_after_target']:.1f} hours")
                     reverted_patterns.append(pattern)
                 else:
-                    print(f"✗ NOT REVERTED: {second_commit[:8]} was not reverted")
+                    print(f"✗ NOT REVERTED: {target_commit[:8]} was not reverted")
                 
                 if args.verbose:
                     print(f"Failed jobs ({len(pattern['failed_job_names'])}):")
@@ -151,11 +155,11 @@ Examples:
                     if len(pattern['failed_job_names']) > 5:
                         print(f"  ... and {len(pattern['failed_job_names']) - 5} more")
                     
-                    print(f"Job coverage overlap ({len(pattern['older_job_coverage'])}):")
-                    for job in pattern['older_job_coverage'][:3]:
-                        print(f"  - {job}")
-                    if len(pattern['older_job_coverage']) > 3:
-                        print(f"  ... and {len(pattern['older_job_coverage']) - 3} more")
+                    print(f"Lookahead commits with same failure:")
+                    for sha in pattern['lookahead_commits'][:5]:
+                        print(f"  - {sha[:8]}")
+                    if len(pattern['lookahead_commits']) > 5:
+                        print(f"  ... and {len(pattern['lookahead_commits']) - 5} more")
                     
                     if revert_result and args.verbose:
                         print(f"Revert message: {revert_result['revert_message'][:100]}...")
@@ -182,7 +186,7 @@ Examples:
             if reverted_patterns:
                 print(f"\nReverted patterns:")
                 for pattern in reverted_patterns:
-                    print(f"  - {pattern['failure_rule']}: {pattern['newer_commits'][1][:8]}")
+                    print(f"  - {pattern['failure_rule']}: {pattern['target_commit'][:8]}")
             
             if args.verbose and total_revert_commits:
                 print(f"\nAll revert commits in period ({len(total_revert_commits)}):")

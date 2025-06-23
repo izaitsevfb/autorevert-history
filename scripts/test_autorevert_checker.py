@@ -5,6 +5,7 @@ CLI tool for autorevert pattern detection with automatic revert checking.
 
 import argparse
 import os
+import re
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
@@ -171,6 +172,10 @@ Examples:
             total_commits = sum(len(checker.get_workflow_commits(w)) for w in workflow_names)
             print(f"Commits checked: {total_commits}")
             
+            # Get total revert commits in the period
+            total_revert_commits = checker.get_revert_commits()
+            print(f"Total revert commits in period: {len(total_revert_commits)}")
+            
             print(f"Patterns detected: {len(patterns)}")
             print(f"Actual reverts: {len(reverted_patterns)} ({len(reverted_patterns)/len(patterns)*100:.1f}%)")
             
@@ -178,6 +183,18 @@ Examples:
                 print(f"\nReverted patterns:")
                 for pattern in reverted_patterns:
                     print(f"  - {pattern['failure_rule']}: {pattern['newer_commits'][1][:8]}")
+            
+            if args.verbose and total_revert_commits:
+                print(f"\nAll revert commits in period ({len(total_revert_commits)}):")
+                for revert in total_revert_commits[:10]:
+                    # Extract the reverted commit SHA from the message
+                    match = re.search(r'This reverts commit ([a-f0-9]{40})', revert['message'])
+                    reverted_sha = match.group(1)[:8] if match else 'unknown'
+                    
+                    print(f"  - {revert['sha'][:8]} reverts {reverted_sha}: {revert['message'].split('\\n')[0][:60]}...")
+                
+                if len(total_revert_commits) > 10:
+                    print(f"  ... and {len(total_revert_commits) - 10} more")
             
             return 0
         else:

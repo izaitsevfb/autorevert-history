@@ -295,6 +295,28 @@ class AutorevertPatternChecker:
         
         return all_patterns
     
+    def is_revert_commit(self, commit: Dict) -> bool:
+        """
+        Check if a commit is a revert commit based on its message.
+        
+        Args:
+            commit: Dict with 'message' field
+            
+        Returns:
+            True if the commit is a revert, False otherwise
+        """
+        message = commit.get('message', '')
+        return message.startswith('Revert "') and 'This reverts commit' in message
+    
+    def get_revert_commits(self) -> List[Dict]:
+        """
+        Get all revert commits from the commit history.
+        
+        Returns:
+            List of revert commits
+        """
+        return [commit for commit in self.commit_history if self.is_revert_commit(commit)]
+    
     def is_commit_reverted(self, target_commit_sha: str) -> Optional[Dict]:
         """
         Check if a commit was reverted within the lookback window.
